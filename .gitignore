@@ -4,6 +4,7 @@ config.ini
 # Ignore lock and state files
 email_automation.lock
 email_automation_state.txt
+email_automation_retry_state.txt
 
 # Ignore Python bytecode and caches
 __pycache__/
