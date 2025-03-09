@@ -4,10 +4,12 @@ import signal
 import email
 import hashlib
 import time
-import re
+import os
+import tempfile
+import subprocess
 from rich.console import Console
 from rich.theme import Theme
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn, TaskProgressColumn
 from datetime import datetime, timezone
 
 custom_theme = Theme({"info": "blue", "success": "green", "warning": "yellow", "error": "red", "highlight": "cyan"})
@@ -136,78 +138,69 @@ def get_message_signatures(mail, folder, start=1, end=None, use_progress=True):
         console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]IMAP error searching {folder}: {e}[/warning]")
         return {}
 
-def fetch_email_headers_and_body(mail, msg_id):
+def fetch_email_as_eml(mail, msg_id):
     try:
         mail.select(SOURCE_FOLDER)
-        status, msg_data = mail.fetch(msg_id, "(BODY[HEADER] BODY[TEXT])")
+        status, msg_data = mail.fetch(msg_id, "(RFC822)")
         if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+            console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]Failed to fetch RFC822 for msg {msg_id}[/warning]")
             return None
-        raw_headers = msg_data[0][1]
-        raw_text = msg_data[1][1].decode('utf-8', errors='ignore') if isinstance(msg_data[1][1], bytes) else ""
-        msg = email.message_from_bytes(raw_headers)
-        msg["BODY[TEXT]"] = raw_text
-        return msg
-    except imaplib.IMAP4.error:
+        raw_email = msg_data[0][1]
+        return raw_email
+    except imaplib.IMAP4.error as e:
+        console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]IMAP error fetching msg {msg_id}: {e}[/warning]")
         return None
 
-def classify_email(msg):
-    if msg is None:
+def classify_email(msg_id, raw_email):
+    if raw_email is None:
+        console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]No raw email data for msg {msg_id}, defaulting to Notifications[/warning]")
         return DEST_FOLDER_NOTIFICATIONS
     
-    subject = msg.get("Subject", "").lower()
-    from_addr = msg.get("From", "").lower()
-    body = msg.get("BODY[TEXT]", "").lower().replace('\r\n', '\n')
+    # Create a temporary .eml file
+    with tempfile.NamedTemporaryFile(dir='/tmp', suffix='.eml', delete=False) as temp_file:
+        temp_file_path = temp_file.name
+        temp_file.write(raw_email)
     
-    # Default to Correspondence
-    dest = DEST_FOLDER_CORRESPONDENCE
-    
-    # 1. Sender Identity Match (fuzzy)
-    sender_name = None
-    salutations = re.findall(r'(best|regards|sincerely|thanks|cheers|kind regards),\s*([a-zA-Z\s]+)$', body, re.MULTILINE)
-    if salutations:
-        sender_name = salutations[-1][1].strip().lower()
-    from_name = re.search(r'([^<]+)<?', from_addr).group(1).strip().lower() if '<' in from_addr else from_addr.split('@')[0].lower()
-    sender_match = sender_name and (
-        sender_name in from_name or 
-        from_name in sender_name or 
-        any(part in from_addr for part in sender_name.split()) or 
-        len(sender_name) > 2  # Loose check for any reasonable name
-    )
-    
-    # 2. Recipient Addressing (fuzzy)
-    recipient_match = False
-    greeting_lines = body.split('\n')[:10]  # Check first 10 lines for broader coverage
-    for line in greeting_lines:
-        if re.search(r'^(chris|knight|cpknight|dear\s+(sir|mr\.?\s+knight|chris)|hi\s+(chris|knight)|hello\s+(chris|knight)),?', line):
-            recipient_match = True
-            break
-    
-    # 3. Subject Matter (must be clear)
-    request_keywords = ["please reply", "can you", "could you", "let me know", "waiting for", "your input", "need your", "respond"]
-    update_keywords = ["here’s the", "update on", "latest", "status", "progress"]
-    response_keywords = ["re:", "fwd:", "regarding your", "in response", "following up"]
-    
-    has_request = any(keyword in body for keyword in request_keywords)
-    has_update = any(keyword in body for keyword in update_keywords)
-    has_response = any(keyword in subject or keyword in body for keyword in response_keywords)
-    subject_matter = has_request or has_update or has_response
-    
-    # Decision: (Sender OR Recipient) AND Subject Matter for Correspondence
-    if not ((sender_match or recipient_match) and subject_matter):
-        dest = DEST_FOLDER_NOTIFICATIONS
-    
-    return dest
+    try:
+        # Call the external classifier with 'classify' as the first argument
+        classifier_cmd = [
+            '/home/cpknight/Projects/email-classifier/email_classifier.py',
+            'classify',
+            '--model', '/home/cpknight/Projects/email-classifier/model.pkl',
+            '--email', temp_file_path
+        ]
+        result = subprocess.run(classifier_cmd, capture_output=True, text=True, check=False)
+        
+        # Parse the output (expecting 'notifications' or 'correspondence')
+        output = result.stdout.strip()
+        if output == "notifications":
+            return DEST_FOLDER_NOTIFICATIONS
+        elif output == "correspondence":
+            return DEST_FOLDER_CORRESPONDENCE
+        else:
+            console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]Classifier error for msg {msg_id}: {output or 'No output'}, stderr: {result.stderr}, defaulting to Notifications[/warning]")
+            return DEST_FOLDER_NOTIFICATIONS
+    except subprocess.SubprocessError as e:
+        console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]Subprocess error for msg {msg_id}: {e}, defaulting to Notifications[/warning]")
+        return DEST_FOLDER_NOTIFICATIONS
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
 
 def move_message(mail, msg_id, uid, source_folder, dest_folder, dest_signatures):
     try:
         mail.select(source_folder)
-        msg = fetch_email_headers_and_body(mail, msg_id)
-        if msg is None:
-            console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]Failed to fetch headers for msg {msg_id} (UID {uid}), skipping[/warning]")
+        raw_email = fetch_email_as_eml(mail, msg_id)
+        if raw_email is None:
+            console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [warning]Failed to fetch raw email for msg {msg_id} (UID {uid}), skipping[/warning]")
             return False
         
         signature = hashlib.md5(
-            (msg.get("Message-ID", "") + msg.get("Subject", "") + msg.get("Date", "") + msg.get("From", "")).encode()
+            (email.message_from_bytes(raw_email).get("Message-ID", "") +
+             email.message_from_bytes(raw_email).get("Subject", "") +
+             email.message_from_bytes(raw_email).get("Date", "") +
+             email.message_from_bytes(raw_email).get("From", "")).encode()
         ).hexdigest()
         
         if signature in dest_signatures:
@@ -241,6 +234,8 @@ def move_messages(mail, signatures, source_folder, notifications_msgs, correspon
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
+        MofNCompleteColumn(),  # Shows "X/Y" completed
+        TaskProgressColumn(),  # Shows percentage
         console=console,
         transient=True
     ) as progress:
@@ -272,7 +267,7 @@ def move_messages(mail, signatures, source_folder, notifications_msgs, correspon
     return not stop_processing and not failed_moves, failed_moves
 
 def verify_moved_messages(mail, signatures, notifications_msgs, correspondence_msgs):
-    console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [info]Verifying moved messages...[/info]")
+    console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [info]Verifying moved-messages...[/info]")
     notif_signatures = get_message_signatures(mail, DEST_FOLDER_NOTIFICATIONS, use_progress=False)
     corr_signatures = get_message_signatures(mail, DEST_FOLDER_CORRESPONDENCE, use_progress=False)
     
@@ -325,17 +320,17 @@ def process_emails():
         correspondence_msgs = []
         console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [info]Classifying {len(batch_signatures)} messages...[/info]")
         with Progress(
-            SpinnerColumn(),
-            TextColumn("[highlight]Classifying {task.total} messages[/highlight]"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
             console=console,
             transient=True
         ) as progress:
-            task = progress.add_task("", total=len(batch_signatures))
+            task = progress.add_task(f"[highlight]Classifying {len(batch_signatures)} messages[/highlight]", total=len(batch_signatures))
             for signature, (uid, msg_id) in batch_signatures.items():
                 if stop_processing:
                     break
-                msg = fetch_email_headers_and_body(mail, msg_id)
-                dest = classify_email(msg)
+                raw_email = fetch_email_as_eml(mail, msg_id)
+                dest = classify_email(msg_id, raw_email)
                 if dest == DEST_FOLDER_NOTIFICATIONS:
                     notifications_msgs.append((signature, uid, msg_id))
                 else:
@@ -344,6 +339,9 @@ def process_emails():
         
         if stop_processing:
             break
+        
+        # Log classification results
+        console.print(f"[grey50][{get_utc_timestamp()}][/grey50] [info]Classification results: {len(notifications_msgs)} notifications, {len(correspondence_msgs)} correspondence[/info]")
         
         completed, failed_moves = move_messages(mail, batch_signatures, SOURCE_FOLDER, notifications_msgs, correspondence_msgs)
         
