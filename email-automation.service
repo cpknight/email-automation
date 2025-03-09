@@ -1,0 +1,14 @@
+[Unit]
+Description=Email Automation Service
+After=network.target
+
+[Service]
+ExecStart=/home/cpknight/Projects/email-automation/email_automation.sh
+Restart=always
+User=cpknight
+Group=cpknight
+WorkingDirectory=/home/cpknight/Projects/email-automation
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
