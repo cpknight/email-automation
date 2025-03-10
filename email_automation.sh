@@ -7,6 +7,8 @@ PROCESSOR="$BASE_DIR/email_processor.py"
 CLASSIFIER="$BASE_DIR/email_classifier.py"
 SUMMARY_INBOX="$BASE_DIR/email_summary_inbox.py"
 SUMMARY_SPAM="$BASE_DIR/email_summary_spam.py"
+SUMMARY_NOTIFICATIONS="$BASE_DIR/email_summary_notifications.py"
+SUMMARY_CORRESPONDENCE="$BASE_DIR/email_summary_correspondence.py"
 ARCHIVE_NOTIFICATIONS="$BASE_DIR/email_archive_notifications.py"
 ARCHIVE_SPAM="$BASE_DIR/email_archive_spam.py"
 ARCHIVE_CORRESPONDENCE="$BASE_DIR/email_archive_correspondence.py"
@@ -38,6 +40,12 @@ CYAN="\033[36m"
 MAGENTA="\033[35m"
 RED="\033[31m"
 RESET="\033[0m"
+
+# Debug flag
+DEBUG=false
+if [ "$1" = "--debug" ]; then
+    DEBUG=true
+fi
 
 # Function to get UTC timestamp
 get_utc_timestamp() {
@@ -72,6 +80,8 @@ read_state() {
         : ${LAST_ARCHIVE_SENT:=0}
         : ${LAST_SUMMARY_INBOX:=0}
         : ${LAST_SUMMARY_SPAM:=0}
+        : ${LAST_SUMMARY_NOTIFICATIONS:=0}
+        : ${LAST_SUMMARY_CORRESPONDENCE:=0}
     else
         LAST_PROCESSOR=0
         LAST_CLASSIFIER=0
@@ -81,6 +91,8 @@ read_state() {
         LAST_ARCHIVE_SENT=0
         LAST_SUMMARY_INBOX=0
         LAST_SUMMARY_SPAM=0
+        LAST_SUMMARY_NOTIFICATIONS=0
+        LAST_SUMMARY_CORRESPONDENCE=0
     fi
 }
 
@@ -94,6 +106,8 @@ LAST_ARCHIVE_CORRESPONDENCE=$LAST_ARCHIVE_CORRESPONDENCE
 LAST_ARCHIVE_SENT=$LAST_ARCHIVE_SENT
 LAST_SUMMARY_INBOX=$LAST_SUMMARY_INBOX
 LAST_SUMMARY_SPAM=$LAST_SUMMARY_SPAM
+LAST_SUMMARY_NOTIFICATIONS=$LAST_SUMMARY_NOTIFICATIONS
+LAST_SUMMARY_CORRESPONDENCE=$LAST_SUMMARY_CORRESPONDENCE
 EOF
 }
 
@@ -109,6 +123,8 @@ read_retry_state() {
         : ${RETRY_ARCHIVE_SENT:=0}
         : ${RETRY_SUMMARY_INBOX:=0}
         : ${RETRY_SUMMARY_SPAM:=0}
+        : ${RETRY_SUMMARY_NOTIFICATIONS:=0}
+        : ${RETRY_SUMMARY_CORRESPONDENCE:=0}
     else
         RETRY_PROCESSOR=0
         RETRY_CLASSIFIER=0
@@ -118,6 +134,8 @@ read_retry_state() {
         RETRY_ARCHIVE_SENT=0
         RETRY_SUMMARY_INBOX=0
         RETRY_SUMMARY_SPAM=0
+        RETRY_SUMMARY_NOTIFICATIONS=0
+        RETRY_SUMMARY_CORRESPONDENCE=0
     fi
 }
 
@@ -131,6 +149,8 @@ RETRY_ARCHIVE_CORRESPONDENCE=$RETRY_ARCHIVE_CORRESPONDENCE
 RETRY_ARCHIVE_SENT=$RETRY_ARCHIVE_SENT
 RETRY_SUMMARY_INBOX=$RETRY_SUMMARY_INBOX
 RETRY_SUMMARY_SPAM=$RETRY_SUMMARY_SPAM
+RETRY_SUMMARY_NOTIFICATIONS=$RETRY_SUMMARY_NOTIFICATIONS
+RETRY_SUMMARY_CORRESPONDENCE=$RETRY_SUMMARY_CORRESPONDENCE
 EOF
 }
 
@@ -154,11 +174,11 @@ get_next_scheduled_time() {
     local last_run=$1
     local interval=$2
     local now=$3
-    local next=$((last_run + interval - (last_run % interval)))
-    if [ "$next" -lt "$now" ]; then
-        next=$((now + interval - (now % interval)))
+    if [ "$last_run" -eq 0 ] || [ $((now - last_run)) -ge "$interval" ]; then
+        echo "$now"  # Run now if overdue
+    else
+        echo $((last_run + interval))  # Next run is last + interval
     fi
-    echo "$next"
 }
 
 # Function to get next daily target (10 AM MT = 16:00 UTC)
@@ -195,6 +215,8 @@ get_friendly_name() {
         "ARCHIVE_SENT") echo "Sent folder archiver" ;;
         "SUMMARY_INBOX") echo "Inbox summary generator" ;;
         "SUMMARY_SPAM") echo "Spam summary generator" ;;
+        "SUMMARY_NOTIFICATIONS") echo "Notifications summary generator" ;;
+        "SUMMARY_CORRESPONDENCE") echo "Correspondence summary generator" ;;
         *) echo "$script" ;;
     esac
 }
@@ -211,6 +233,8 @@ get_script_path() {
         "ARCHIVE_SENT") echo "$ARCHIVE_SENT" ;;
         "SUMMARY_INBOX") echo "$SUMMARY_INBOX" ;;
         "SUMMARY_SPAM") echo "$SUMMARY_SPAM" ;;
+        "SUMMARY_NOTIFICATIONS") echo "$SUMMARY_NOTIFICATIONS" ;;
+        "SUMMARY_CORRESPONDENCE") echo "$SUMMARY_CORRESPONDENCE" ;;
         *) echo "$script" ;;
     esac
 }
@@ -277,7 +301,7 @@ print_next_event() {
     
     local time_until=$((next_time - now))
     echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Next event: $next_script in $(format_time $time_until) at $(date -u -d "@$next_time" '+%Y-%m-%d %H:%M:%S UTC')${RESET}"
-    echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Next archives: $(主的date -u -d "@$next_daily" '+%Y-%m-%d %H:%M:%S UTC') ($(format_time $((next_daily - now))))${RESET}"
+    echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Next archives: $(date -u -d "@$next_daily" '+%Y-%m-%d %H:%M:%S UTC') ($(format_time $((next_daily - now))))${RESET}"
     echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Next summaries: $(date -u -d "@$next_daily" '+%Y-%m-%d %H:%M:%S UTC') ($(format_time $((next_daily - now))))${RESET}"
 }
 
@@ -308,9 +332,22 @@ run_script() {
     if [ "$interval" -eq 0 ]; then
         next_run=$now
     else
-        next_run=$(get_next_scheduled_time "$last_run" "$interval" "$now")
+        if [ "$last_run" -eq 0 ] || [ $((now - last_run)) -ge "$interval" ]; then
+            next_run=$now  # Run now if overdue
+        else
+            next_run=$((last_run + interval))  # Next run is last + interval
+        fi
     fi
-
+    
+    if [ "$DEBUG" = true ]; then
+        local friendly_name=$(get_friendly_name "$(basename "$script" .py | tr '[:lower:]' '[:upper:]' | sed 's/EMAIL_//')")
+        local time_since=$((now - last_run))
+        local time_to_next=$((next_run - now))
+        [ "$last_run" -eq 0 ] && time_since="never" || time_since=$(format_time "$time_since")
+        [ "$time_to_next" -lt 0 ] && time_to_next=0
+        echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Checking $friendly_name: last ran $time_since ago, next in $(format_time $time_to_next)${RESET}"
+    fi
+    
     if [ "$now" -ge "$next_run" ]; then
         if ! check_bridge_process; then
             return 0
@@ -359,42 +396,34 @@ main_loop() {
     read_state
     read_retry_state
     
-    # Startup message with last run times
+    # Startup message with last run times and overdue check
     echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Starting email_automation.sh (PID $$) at $BASE_DIR/email_automation.sh${RESET}"
     echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Intervals: Processor every $(format_time $PROCESSOR_INTERVAL), Classifier every $(format_time $CLASSIFIER_INTERVAL), Daily tasks every $(format_time $DAILY_INTERVAL) at ${DAILY_TARGET_HOUR}:00 UTC${RESET}"
-    for script in "PROCESSOR" "CLASSIFIER" "ARCHIVE_NOTIFICATIONS" "ARCHIVE_SPAM" "ARCHIVE_CORRESPONDENCE" "ARCHIVE_SENT" "SUMMARY_INBOX" "SUMMARY_SPAM"; do
+    
+    local now=$(date +%s)
+    local next_daily=$(get_next_daily_target "$now")
+    local overdue=false
+    for script in "PROCESSOR" "CLASSIFIER" "ARCHIVE_NOTIFICATIONS" "ARCHIVE_SPAM" "ARCHIVE_CORRESPONDENCE" "ARCHIVE_SENT" "SUMMARY_INBOX" "SUMMARY_SPAM" "SUMMARY_NOTIFICATIONS" "SUMMARY_CORRESPONDENCE"; do
         local var="LAST_$script"
         local friendly_name=$(get_friendly_name "$script")
         if [ -z "${!var}" ] || [ "${!var}" -eq 0 ]; then
             echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}The $friendly_name has never run.${RESET}"
+            if [[ "$script" != "PROCESSOR" && "$script" != "CLASSIFIER" ]]; then
+                overdue=true
+            fi
         else
-            local time_since=$(( $(date +%s) - ${!var} ))
+            local time_since=$((now - ${!var}))
             echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}The $friendly_name last ran $(format_time $time_since) ago at $(date -u -d "@${!var}" '+%Y-%m-%d %H:%M:%S UTC').${RESET}"
+            if [[ "$script" != "PROCESSOR" && "$script" != "CLASSIFIER" && $time_since -ge $DAILY_INTERVAL ]]; then
+                overdue=true
+                echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}The $friendly_name is overdue by $(format_time $time_since).${RESET}"
+            fi
         fi
     done
     
     if ! check_bridge_process; then
         echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${RED}Initial check failed: Proton Mail Bridge not running. Proceeding with caution.${RESET}"
     fi
-    
-    # Check if any daily tasks are overdue (>24h)
-    local now=$(date +%s)
-    local next_daily=$(get_next_daily_target "$now")
-    local overdue=false
-    for script in "ARCHIVE_NOTIFICATIONS" "ARCHIVE_SPAM" "ARCHIVE_CORRESPONDENCE" "ARCHIVE_SENT" "SUMMARY_INBOX" "SUMMARY_SPAM"; do
-        local var="LAST_$script"
-        local last_run="${!var:-0}"
-        local time_since_last=$((now - last_run))
-        if [ "$last_run" -eq 0 ] || [ "$time_since_last" -ge "$DAILY_INTERVAL" ]; then
-            overdue=true
-            local friendly_name=$(get_friendly_name "$script")
-            if [ "$last_run" -eq 0 ]; then
-                echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}The $friendly_name has never run.${RESET}"
-            else
-                echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}The $friendly_name is overdue by $(format_time $time_since_last).${RESET}"
-            fi
-        fi
-    done
     
     if [ "$overdue" = true ]; then
         echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Some daily tasks are overdue. Running catch-up sequence...${RESET}"
@@ -412,7 +441,7 @@ main_loop() {
             fi
         done
         echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Running daily summaries${RESET}"
-        for script in "SUMMARY_INBOX" "SUMMARY_SPAM"; do
+        for script in "SUMMARY_INBOX" "SUMMARY_SPAM" "SUMMARY_NOTIFICATIONS" "SUMMARY_CORRESPONDENCE"; do
             local friendly_name=$(get_friendly_name "$script")
             local script_path=$(get_script_path "$script")
             run_script "$script_path" "0" "LAST_$script" "RETRY_$script" && true
@@ -437,7 +466,7 @@ main_loop() {
 
         if [ "$now" -ge "$next_daily" ]; then
             local run_daily=false
-            for script in "ARCHIVE_NOTIFICATIONS" "ARCHIVE_SPAM" "ARCHIVE_CORRESPONDENCE" "ARCHIVE_SENT" "SUMMARY_INBOX" "SUMMARY_SPAM"; do
+            for script in "ARCHIVE_NOTIFICATIONS" "ARCHIVE_SPAM" "ARCHIVE_CORRESPONDENCE" "ARCHIVE_SENT" "SUMMARY_INBOX" "SUMMARY_SPAM" "SUMMARY_NOTIFICATIONS" "SUMMARY_CORRESPONDENCE"; do
                 local var="LAST_$script"
                 local last_run="${!var:-0}"
                 if [ "$last_run" -eq 0 ] || [ $((now - last_run)) -ge "$DAILY_INTERVAL" ]; then
@@ -459,7 +488,7 @@ main_loop() {
                 done
 
                 echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${YELLOW}Running daily summaries${RESET}"
-                for script in "SUMMARY_INBOX" "SUMMARY_SPAM"; do
+                for script in "SUMMARY_INBOX" "SUMMARY_SPAM" "SUMMARY_NOTIFICATIONS" "SUMMARY_CORRESPONDENCE"; do
                     local friendly_name=$(get_friendly_name "$script")
                     local script_path=$(get_script_path "$script")
                     run_script "$script_path" "0" "LAST_$script" "RETRY_$script" && true
@@ -472,7 +501,7 @@ main_loop() {
             fi
         fi
 
-        sleep 60
+        sleep 10  # Check every 10s for responsiveness
     done
 }
 
