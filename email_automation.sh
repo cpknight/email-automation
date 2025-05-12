@@ -196,7 +196,7 @@ get_next_daily_target() {
 
 # Function to check Proton Mail Bridge process
 check_bridge_process() {
-    if ! pgrep -f "protonmail-bridge" >/dev/null 2>&1; then
+    if ! pgrep -f "proton-bridge" >/dev/null 2>&1; then
         echo -e "${GREY50}[$(get_utc_timestamp)]${RESET} ${RED}Proton Mail Bridge process not running. Skipping script execution.${RESET}"
         return 1
     fi
