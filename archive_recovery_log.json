@@ -1,0 +1,23 @@
+{
+  "completion_time": "2025-08-07 19:08:15 UTC",
+  "folder_stats": {
+    "Folders/Processing": {
+      "found": 0,
+      "moved": 0,
+      "failed": 0
+    },
+    "Folders/Correspondence": {
+      "found": 0,
+      "moved": 0,
+      "failed": 0
+    },
+    "Folders/Notifications": {
+      "found": 332,
+      "moved": 264,
+      "failed": 0
+    }
+  },
+  "total_processed": 989,
+  "total_failed": 17,
+  "interrupted": false
+}
